@@ -71,6 +71,31 @@ namespace Valheim_Serverside.Features
 			return t;
 		}
 
+		// Null-safe substitutes for Player.m_localPlayer reads found inside
+		// vanilla methods the server reaches once it owns objects (see
+		// Pickable_RPC_Pick_Patch below for the full story of why this
+		// class of bug exists). Player.m_localPlayer is always null on a
+		// dedicated server -- these return the same "nobody" values vanilla
+		// itself already falls back to in the spots that DO null-check
+		// first (e.g. Container.RPC_OpenResponse).
+		private static class LocalPlayerSafety
+		{
+			public static ZDOID SafeZDOID()
+			{
+				return Player.m_localPlayer != null ? Player.m_localPlayer.GetZDOID() : ZDOID.None;
+			}
+
+			public static long SafePlayerID()
+			{
+				return Player.m_localPlayer != null ? Player.m_localPlayer.GetPlayerID() : -1L;
+			}
+
+			public static string SafePlayerName()
+			{
+				return Player.m_localPlayer != null ? Player.m_localPlayer.GetPlayerName() : "Server";
+			}
+		}
+
 		[HarmonyPatch(typeof(Pickable), "RPC_Pick")]
 		public static class Pickable_RPC_Pick_Patch
 		/*
@@ -98,16 +123,11 @@ namespace Valheim_Serverside.Features
 			item for everyone) untouched and unduplicated.
 		*/
 		{
-			public static ZDOID SafeLocalPlayerZDOID()
-			{
-				return Player.m_localPlayer != null ? Player.m_localPlayer.GetZDOID() : ZDOID.None;
-			}
-
 			static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
 			{
 				var m_localPlayerField = AccessTools.Field(typeof(Player), nameof(Player.m_localPlayer));
 				var getZDOID = AccessTools.Method(typeof(Character), nameof(Character.GetZDOID));
-				var safeMethod = AccessTools.Method(typeof(Pickable_RPC_Pick_Patch), nameof(SafeLocalPlayerZDOID));
+				var safeMethod = AccessTools.Method(typeof(LocalPlayerSafety), nameof(LocalPlayerSafety.SafeZDOID));
 
 				var codes = new List<CodeInstruction>(instructions);
 				for (int i = 0; i < codes.Count - 1; i++)
@@ -115,12 +135,148 @@ namespace Valheim_Serverside.Features
 					if (codes[i].opcode == OpCodes.Ldsfld && codes[i].OperandIs(m_localPlayerField)
 						&& codes[i + 1].opcode == OpCodes.Callvirt && codes[i + 1].OperandIs(getZDOID))
 					{
-						codes[i] = new CodeInstruction(OpCodes.Call, safeMethod);
+						// Preserve any labels (branch targets) attached to the
+						// instruction being replaced -- see
+						// Ship_UpdateSailSize_Patch for why this matters.
+						codes[i] = new CodeInstruction(OpCodes.Call, safeMethod) { labels = codes[i].labels };
 						codes.RemoveAt(i + 1);
 						break;
 					}
 				}
 				return codes;
+			}
+		}
+
+		[HarmonyPatch(typeof(Ship), "UpdateSailSize")]
+		public static class Ship_UpdateSailSize_Patch
+		/*
+			UpdateSailSize throws a NullReferenceException on the server
+			whenever a sail hasn't yet reached its target position and was
+			previously "in position" -- confirmed via IL disassembly: it
+			unconditionally reads Player.m_localPlayer twice while building
+			a ZDOID used only for a debug log line and a cosmetic effect.
+			The crash happens BEFORE the actual sail-position Lerp/cloth
+			update later in the same method, so on a dedicated server a sail
+			that starts moving never finishes -- the exception refires every
+			physics tick until it does (never).
+
+			Fix: same transpiler approach as Pickable_RPC_Pick_Patch -- swap
+			both Player.m_localPlayer reads for the shared null-safe
+			equivalents, leaving the actual sail-position update untouched.
+		*/
+		{
+			static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
+			{
+				var m_localPlayerField = AccessTools.Field(typeof(Player), nameof(Player.m_localPlayer));
+				var getPlayerID = AccessTools.Method(typeof(Player), nameof(Player.GetPlayerID));
+				var getZDOID = AccessTools.Method(typeof(Character), nameof(Character.GetZDOID));
+				var safeID = AccessTools.Method(typeof(LocalPlayerSafety), nameof(LocalPlayerSafety.SafePlayerID));
+				var safeZDOID = AccessTools.Method(typeof(LocalPlayerSafety), nameof(LocalPlayerSafety.SafeZDOID));
+
+				var codes = new List<CodeInstruction>(instructions);
+				for (int i = 0; i < codes.Count - 1; i++)
+				{
+					if (codes[i].opcode != OpCodes.Ldsfld || !codes[i].OperandIs(m_localPlayerField))
+					{
+						continue;
+					}
+
+					// One of these two ldsfld instructions (the second, in
+					// practice) is itself a branch target -- replacing it
+					// with a plain `new CodeInstruction(...)` drops its
+					// .labels, orphaning whatever jumps there and producing
+					// an invalid method ("Label #N is not marked"). Carry
+					// the original instruction's labels over explicitly.
+					if (codes[i + 1].opcode == OpCodes.Callvirt && codes[i + 1].OperandIs(getPlayerID))
+					{
+						var replacement = new CodeInstruction(OpCodes.Call, safeID) { labels = codes[i].labels };
+						codes[i] = replacement;
+						codes.RemoveAt(i + 1);
+					}
+					else if (codes[i + 1].opcode == OpCodes.Callvirt && codes[i + 1].OperandIs(getZDOID))
+					{
+						var replacement = new CodeInstruction(OpCodes.Call, safeZDOID) { labels = codes[i].labels };
+						codes[i] = replacement;
+						codes.RemoveAt(i + 1);
+					}
+				}
+				return codes;
+			}
+		}
+
+		[HarmonyPatch(typeof(CookingStation), "SpawnItem")]
+		public static class CookingStation_SpawnItem_Patch
+		/*
+			SpawnItem throws a NullReferenceException on the server whenever
+			m_recordCrafter is true (e.g. the Frost Foundry) -- confirmed via
+			IL disassembly: it unconditionally reads
+			Player.m_localPlayer.GetPlayerID()/GetPlayerName() to attribute
+			the crafted item. The exception fires AFTER the item has already
+			been instantiated, aborting the method before whatever clears
+			the cooking slot afterward runs -- duplicating the item every
+			time the station is used on the server.
+
+			Fix: same transpiler approach as Pickable_RPC_Pick_Patch --
+			replace both Player.m_localPlayer reads with the shared
+			null-safe equivalents (crafter attribution becomes "Server"
+			instead of a real player, the same tradeoff vanilla itself
+			already makes elsewhere), letting the method run to completion
+			so the slot actually clears and the item stops duplicating.
+		*/
+		{
+			static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
+			{
+				var m_localPlayerField = AccessTools.Field(typeof(Player), nameof(Player.m_localPlayer));
+				var getPlayerID = AccessTools.Method(typeof(Player), nameof(Player.GetPlayerID));
+				var getPlayerName = AccessTools.Method(typeof(Player), nameof(Player.GetPlayerName));
+				var safeID = AccessTools.Method(typeof(LocalPlayerSafety), nameof(LocalPlayerSafety.SafePlayerID));
+				var safeName = AccessTools.Method(typeof(LocalPlayerSafety), nameof(LocalPlayerSafety.SafePlayerName));
+
+				var codes = new List<CodeInstruction>(instructions);
+				for (int i = 0; i < codes.Count - 1; i++)
+				{
+					if (codes[i].opcode != OpCodes.Ldsfld || !codes[i].OperandIs(m_localPlayerField))
+					{
+						continue;
+					}
+
+					// Preserve any labels (branch targets) attached to the
+					// instruction being replaced -- see
+					// Ship_UpdateSailSize_Patch for why this matters.
+					if (codes[i + 1].opcode == OpCodes.Callvirt && codes[i + 1].OperandIs(getPlayerID))
+					{
+						var replacement = new CodeInstruction(OpCodes.Call, safeID) { labels = codes[i].labels };
+						codes[i] = replacement;
+						codes.RemoveAt(i + 1);
+					}
+					else if (codes[i + 1].opcode == OpCodes.Callvirt && codes[i + 1].OperandIs(getPlayerName))
+					{
+						var replacement = new CodeInstruction(OpCodes.Call, safeName) { labels = codes[i].labels };
+						codes[i] = replacement;
+						codes.RemoveAt(i + 1);
+					}
+				}
+				return codes;
+			}
+		}
+
+		[HarmonyPatch(typeof(Leviathan), "RPC_Left")]
+		public static class Leviathan_RPC_Left_Patch
+		/*
+			RPC_Left throws a NullReferenceException on the server --
+			confirmed via IL disassembly: it unconditionally reads
+			Player.m_localPlayer.transform.position purely to decide whether
+			to increment a per-client stat. There's no local player on a
+			dedicated server to increment a stat for, so unlike
+			Ship/CookingStation above this doesn't need a transpiler --
+			skipping the whole method when headless matches vanilla's own
+			convention elsewhere (e.g. Container.RPC_OpenResponse already
+			returns immediately when Player.m_localPlayer is null).
+		*/
+		{
+			static bool Prefix()
+			{
+				return Player.m_localPlayer != null;
 			}
 		}
 
@@ -233,6 +389,14 @@ namespace Valheim_Serverside.Features
 							SafeMethod(__instance, "CreateLocalZones", znetPeer.GetRefPos()).GetValue();
 						}
 					}
+					// Vanilla calls this every tick to decrement each loaded
+					// location prefab's lifetime countdown and Release() it
+					// once expired. This patch never called it, so
+					// m_locationPrefabs only ever grows -- an unbounded leak
+					// of every location prefab loaded since boot, worse the
+					// more of the map gets explored. Confirmed via IL
+					// disassembly of ZoneSystem.UpdatePrefabLifetimes.
+					SafeMethod(__instance, "UpdatePrefabLifetimes").GetValue();
 				}
 				return false;
 			}
