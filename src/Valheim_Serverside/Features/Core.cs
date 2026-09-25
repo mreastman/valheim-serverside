@@ -1,9 +1,11 @@
 using FeaturesLib;
 using HarmonyLib;
+using PluginConfiguration;
 using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using UnityEngine;
 using OpCode = System.Reflection.Emit.OpCode;
 using OpCodes = System.Reflection.Emit.OpCodes;
@@ -308,6 +310,13 @@ namespace Valheim_Serverside.Features
 			{
 				List<ZDO> m_tempCurrentObjects = new List<ZDO>();
 				List<ZDO> m_tempCurrentDistantObjects = new List<ZDO>();
+				// Vanilla reads the synced value from ZNet here, not ZoneSystem's own
+				// copy -- using ZoneSystem.instance.m_simulationDistance instead was
+				// silently widening (or otherwise mismatching) the active/create area
+				// versus what vanilla intends, sweeping in objects that shouldn't have
+				// counted as "nearby" yet. Confirmed against another fork of this mod
+				// that got this right from the start.
+				SimulationDistance simulationDistance = ZNet.instance.GetSyncedSimulationDistance();
 				foreach (ZNetPeer znetPeer in ZNet.instance.GetConnectedPeers())
 				{
 					// 1.0: ZoneSystem.GetZone now returns Vector2s (Vector2i is
@@ -315,7 +324,7 @@ namespace Valheim_Serverside.Features
 					// SimulationDistance instead of separate near/far ints
 					// (ZoneSystem.m_activeArea/m_activeDistantArea no longer exist).
 					Vector2s zone = ZoneSystem.GetZone(znetPeer.GetRefPos());
-					ZDOMan.instance.FindSectorObjects(zone, ZoneSystem.instance.m_simulationDistance, m_tempCurrentObjects, m_tempCurrentDistantObjects);
+					ZDOMan.instance.FindSectorObjects(zone, simulationDistance, m_tempCurrentObjects, m_tempCurrentDistantObjects);
 				}
 
 				m_tempCurrentDistantObjects = m_tempCurrentDistantObjects.Distinct().ToList();
@@ -366,6 +375,9 @@ namespace Valheim_Serverside.Features
 						only to send associated information to clients.
 		*/
 		{
+			// Which peer the round-robin zone budget (below) picks up from next tick.
+			private static int s_nextPeerIndex;
+
 			static bool Prefix(ZoneSystem __instance, ref float ___m_updateTimer)
 			{
 				if (ZNet.GetConnectionStatus() != ZNet.ConnectionStatus.Connected)
@@ -384,9 +396,26 @@ namespace Valheim_Serverside.Features
 					{
 						//Traverse.Create(__instance).Method("CreateGhostZones", ZNet.instance.GetReferencePosition()).GetValue();
 						//UnityEngine.Debug.Log(String.Concat(new object[] { "CreateLocalZones for", refPoint.x, " ", refPoint.y, " ", refPoint.z }));
-						foreach (ZNetPeer znetPeer in ZNet.instance.GetPeers())
+						// A zone is generated in full in one frame (terrain, vegetation,
+						// locations), so giving every peer a zone the same tick spikes
+						// whenever several players explore at once. Budget at most
+						// MaxZonesPerTick actual generations per tick, peers taking
+						// turns starting from whoever was skipped last time -- a peer
+						// that already has a current zone doesn't spend any of the
+						// budget (CreateLocalZones returns false for it), so it never
+						// starves an exploring player waiting behind a stationary one.
+						List<ZNetPeer> peers = ZNet.instance.GetPeers();
+						int zoneBudget = Configuration.maxZonesPerTick.Value > 0 ? Configuration.maxZonesPerTick.Value : peers.Count;
+						int peerCount = peers.Count;
+						int generated = 0;
+						for (int n = 0; n < peerCount && generated < zoneBudget; n++)
 						{
-							SafeMethod(__instance, "CreateLocalZones", znetPeer.GetRefPos()).GetValue();
+							int index = (s_nextPeerIndex + n) % peerCount;
+							if (SafeMethod(__instance, "CreateLocalZones", peers[index].GetRefPos()).GetValue<bool>())
+							{
+								generated++;
+								s_nextPeerIndex = (index + 1) % peerCount;
+							}
 						}
 					}
 					// Vanilla calls this every tick to decrement each loaded
@@ -398,6 +427,120 @@ namespace Valheim_Serverside.Features
 					// disassembly of ZoneSystem.UpdatePrefabLifetimes.
 					SafeMethod(__instance, "UpdatePrefabLifetimes").GetValue();
 				}
+				return false;
+			}
+		}
+
+		[HarmonyPatch(typeof(ZoneSystem), "UpdatePrefabLifetimes")]
+		public static class ZoneSystem_UpdatePrefabLifetimes_Patch
+		/*
+			Vanilla decrements every loaded-location-prefab's lifetime
+			countdown and Release()s+removes it once expired, with no regard
+			for whether the underlying SoftReferenceableAssets load has
+			actually finished yet (LocationPrefabLoadData.IsLoaded only
+			becomes true via an OnPrefabLoaded/OnRoomLoaded async callback).
+
+			Confirmed live: on this dedicated server, some locations' prefab
+			loads never complete -- IsLoaded stays false forever, apparently
+			because a headless server never receives that callback for these.
+			Restoring the call above to UpdatePrefabLifetimes (to fix the
+			m_locationPrefabs leak) meant vanilla's blind countdown now
+			evicts that in-flight, never-loaded entry before it ever loads --
+			and PokeCanSpawnLocation just creates a brand new one on the very
+			next retry. Result: the same location gets requested, evicted,
+			and re-requested forever. Confirmed in the live log: one location
+			alone re-triggered 106+ times over two hours, continuously,
+			generating constant ZDO ownership churn (repeating "Server
+			claimed ownership of LocationProxy/*LocationMusic" at the same
+			coordinates) and, per player reports, real lag -- coinciding
+			with when the UpdatePrefabLifetimes fix went live.
+
+			Fix: only count down/evict entries that have actually finished
+			loading. A truly-loaded-and-idle prefab still gets released on
+			schedule (preserving the original leak fix); an in-flight load
+			is left alone instead of being evicted mid-flight.
+
+			Residual gap this closes: an entry whose load never completes at
+			all (confirmed live -- some locations' IsLoaded simply never
+			becomes true on this headless server) is *permanently* skipped by
+			the `!entry.IsLoaded` guard above -- nothing ever counts it down
+			or releases it, so it sits in m_locationPrefabs forever. Every
+			session leaves some fraction of these behind, and unlike the
+			churn-driven memory use elsewhere (proportional to explored area,
+			confirmed to plateau when exploration stops), none of these are
+			ever given back -- a slow, permanent leak on top of that. IL
+			confirms LocationPrefabLoadData is a class (extends
+			System.Object), so the m_iterationLifetime decrement above
+			correctly persists for entries that DO load; this gap is
+			specifically about ones that never do.
+
+			Fix: track how long each not-yet-loaded entry has sat unfinished
+			(keyed by the entry's own identity via ConditionalWeakTable, so
+			this never itself keeps an otherwise-dead entry alive). Past
+			StuckLocationPrefabTimeoutSeconds (default 5 minutes -- generous,
+			well beyond any legitimate slow load), force-release and drop it
+			anyway, same as vanilla's own unconditional Release() on eviction,
+			just bounded instead of immediate. Logged so this is observable
+			rather than silent.
+		*/
+		{
+			private static readonly ConditionalWeakTable<ZoneSystem.LocationPrefabLoadData, StrongBox<float>> s_unloadedSince = new ConditionalWeakTable<ZoneSystem.LocationPrefabLoadData, StrongBox<float>>();
+			private static float s_lastCountLogTime;
+
+			static bool Prefix(List<ZoneSystem.LocationPrefabLoadData> ___m_locationPrefabs, List<int> ___m_tempLocationPrefabsToRelease)
+			{
+				float now = Time.time;
+				float timeout = Configuration.stuckLocationPrefabTimeout.Value;
+
+				for (int i = 0; i < ___m_locationPrefabs.Count; i++)
+				{
+					var entry = ___m_locationPrefabs[i];
+					if (!entry.IsLoaded)
+					{
+						if (timeout <= 0f)
+						{
+							continue;
+						}
+						if (s_unloadedSince.TryGetValue(entry, out var since))
+						{
+							if (now - since.Value > timeout)
+							{
+								___m_tempLocationPrefabsToRelease.Add(i);
+								s_unloadedSince.Remove(entry);
+								ServersidePlugin.logger.LogWarning($"UpdatePrefabLifetimes: force-releasing a location prefab load stuck unfinished for over {timeout}s -- would otherwise have accumulated in memory permanently.");
+							}
+						}
+						else
+						{
+							s_unloadedSince.Add(entry, new StrongBox<float>(now));
+						}
+						continue;
+					}
+					s_unloadedSince.Remove(entry);
+					entry.m_iterationLifetime--;
+					if (entry.m_iterationLifetime <= 0)
+					{
+						___m_tempLocationPrefabsToRelease.Add(i);
+					}
+				}
+				for (int i = ___m_tempLocationPrefabsToRelease.Count - 1; i >= 0; i--)
+				{
+					int idx = ___m_tempLocationPrefabsToRelease[i];
+					___m_locationPrefabs[idx].Release();
+					___m_locationPrefabs.RemoveAt(idx);
+				}
+				___m_tempLocationPrefabsToRelease.Clear();
+
+				// Periodic visibility into the list this whole patch exists to
+				// bound -- the only direct way to confirm (rather than infer
+				// from overall process memory) whether this stays flat over a
+				// long session instead of quietly climbing again.
+				if (now - s_lastCountLogTime > 600f)
+				{
+					s_lastCountLogTime = now;
+					ServersidePlugin.logger.LogInfo($"UpdatePrefabLifetimes: m_locationPrefabs.Count={___m_locationPrefabs.Count}");
+				}
+
 				return false;
 			}
 		}
@@ -420,7 +563,9 @@ namespace Valheim_Serverside.Features
 
 				// Far=0 replicates the old "near objects only" call (no separate
 				// activeDistantArea param exists anymore to pass 0 for directly).
-				var currentDistance = ZoneSystem.instance.m_simulationDistance;
+				// Reads the ZNet-synced distance, not ZoneSystem's own copy -- see
+				// the matching comment in CreateDestroyObjects_Patch above.
+				var currentDistance = ZNet.instance.GetSyncedSimulationDistance();
 				var nearOnlyDistance = new SimulationDistance(currentDistance.NearSimulationDistance, 0, currentDistance.IsClassic);
 				__instance.FindSectorObjects(zone, nearOnlyDistance, m_tempNearObjects, null);
 				foreach (ZDO zdo in m_tempNearObjects)
